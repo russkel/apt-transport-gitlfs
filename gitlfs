@@ -1,371 +1,20 @@
 #!/usr/bin/python3 -u
 
+# Author: Russ Webber <russ.webber@greenroomrobotics.com>
 
-import urllib.request
-import urllib.error
-import urllib.parse
 import time
 import hashlib
-import hmac
-import json
 import sys
 import os
-import datetime
-import xml.etree.ElementTree as ET
-import socket
-import ssl
-from configobj import ConfigObj
+import logging
+import traceback
+import urllib.parse
+from urllib.parse import urlparse
+from pathlib import Path
+import subprocess
 
-RETRIES = 5
-
-def wait_time(c):
-    return pow(2, c) - 1
-
-
-class AWSCredentials(object):
-    """
-    Class for dealing with IAM role credentials from meta-data server and later
-    on to deal with boto/aws config provided keys
-    """
-
-    def __init__(self, config_file=None):
-        self.conf_file = config_file
-        host = 'http://169.254.169.254'
-        path_session_token = 'latest/api/token'
-        path_sec_cred = '/latest/meta-data/iam/security-credentials/'
-        path_instance_metadata = '/latest/dynamic/instance-identity/document'
-        self.session_token_metadata = urllib.parse.urljoin(host, path_session_token)
-        self.credentials_metadata = urllib.parse.urljoin(host, path_sec_cred)
-        self.instance_metadata = urllib.parse.urljoin(
-            host, path_instance_metadata)
-        self.session_token = None
-
-    def __imdsv2_ensure_token(self):
-        # Get IMDSv2 session token
-        request = urllib.request.Request(self.session_token_metadata, method='PUT', headers={TOKEN_HEADER_TTL: TOKEN_TTL_SECONDS})
-
-        response = None
-
-        for i in range(0, RETRIES):
-            try:
-                response = urllib.request.urlopen(request, None, 10)
-                self.session_token = response.read()
-                break
-            except ssl.SSLError as e:
-                if 'IMDSv2 timed out' in e.message:
-                    time.sleep(wait_time(i + 1))
-                else:
-                    raise e
-            except socket.timeout:
-                time.sleep(wait_time(i + 1))
-            except urllib.error.URLError as e:
-                if hasattr(e, 'reason'):
-                    raise Exception("IMDSv2 URL error reason: {}, probable cause is \
- that you don't have IAM role on this machine".format(e.reason))
-                elif hasattr(e, 'code'):
-                    raise Exception("Server error code: {}".format(e.code))
-            finally:
-                if response:
-                    response.close()
-        else:
-            raise Exception("IMDSv2 session token request timed out")
-
-    def __get_role(self):
-        if not self.session_token:
-             self.__imdsv2_ensure_token()
-
-        # Read IAM role from AWS metadata store
-        request = urllib.request.Request(self.credentials_metadata, headers={TOKEN_HEADER: self.session_token})
-
-        response = None
-
-        for i in range(0, RETRIES):
-            try:
-                response = urllib.request.urlopen(request, None, 10)
-                self.iamrole = str(response.read(), "utf-8")
-                break
-            except ssl.SSLError as e:
-                if 'timed out' in e.message:
-                    time.sleep(wait_time(i + 1))
-                else:
-                    raise e
-            except socket.timeout:
-                time.sleep(wait_time(i + 1))
-            except urllib.error.URLError as e:
-                if hasattr(e, 'reason'):
-                    raise Exception("URL error reason: {}, probable cause is \
- that you don't have IAM role on this machine".format(e.reason))
-                elif hasattr(e, 'code'):
-                    raise Exception("Server error code: {}".format(e.code))
-            finally:
-                if response:
-                    response.close()
-        else:
-            raise Exception("GetRole request timed out")
-
-    def __load_config(self):
-        """
-        Loading config file from predefined location.
-        Example config file content:
-            AccessKeyId = mykey
-            SecretAccessKey = mysecretkey
-            Region = eu-west-2 # this is obligatory if instance is in different
-                                 region then apt repo
-        """
-
-        # Checking if 'file' exists, if it does read it
-        if os.path.isfile(os.path.expanduser(self.conf_file)):
-            config = ConfigObj(os.path.expanduser(self.conf_file))
-            return config
-        else:
-            raise Exception("Config file: {} doesn't exist".format(self.conf_file))
-
-    def __request_json(self, url):
-        if not self.session_token:
-             self.__imdsv2_ensure_token()
-
-        request = urllib.request.Request(url, headers={TOKEN_HEADER: self.session_token})
-        response = None
-
-        for i in range(0, RETRIES):
-            try:
-                response = urllib.request.urlopen(request, None, 30)
-                return json.loads(response.read().decode('utf-8'))
-            except ssl.SSLError as e:
-                if 'timed out' in e.message:
-                    time.sleep(wait_time(i + 1))
-                else:
-                    raise e
-            except socket.timeout:
-                time.sleep(wait_time(i + 1))
-            except urllib.error.URLError as e:
-                if hasattr(e, 'reason'):
-                    raise Exception("URL error reason: {}".format(e.reason))
-                elif hasattr(e, 'code'):
-                    raise Exception("Server error code: {}".format(e.code))
-            finally:
-                if response:
-                    response.close()
-
-        raise Exception("request for {} timed out".format(url))
-
-    def __get_region(self, config):
-        # try to load region from config file
-        region = config.get('Region')
-        # if region is not defied load it from instance metadata
-        if region is None or region == '':
-            region = self.__request_json(self.instance_metadata)['region']
-
-        return region
-
-    def __get_endpoint(self, config):
-        """ We assume that if endpoint attribute exists in the config this
-        takes priority over Region and bucket URL construction. If it doesn't
-        exist checking Region and comparing it to the dict containing special
-        regions (slightly different fqdn's). If it's there use it, if not
-        construct host for bucket url using Region from the config or from the
-        instance metadata (if bucket and host are in the same region it will
-        work, if not error will be thrown)
-        """
-        if config.get('Endpoint') is not None:
-            host = config['Endpoint']
-        else:
-            if self.region in list(SPECIAL_REGION_ENDPOINTS.keys()):
-                host = SPECIAL_REGION_ENDPOINTS[self.region]
-            else:
-                host = 's3.{}.amazonaws.com'.format(self.region)
-
-        return host
-
-    def get_credentials(self):
-        """
-        Read IAM credentials from AWS metadata store.
-        Note: This method should be explicitly called after constructing new
-              object, as in 'explicit is better than implicit'.
-        """
-        data = {}
-
-        try:
-            data = self.__load_config()
-        except:
-            pass
-
-        self.region = self.__get_region(data)
-        self.host = self.__get_endpoint(data)
-
-        # Setting up AWS creds based on environment variables if env vars
-        # doesn't exist setting var value to None
-        if data.get("AccessKeyId") is None:
-            data['AccessKeyId'] = os.environ.get("AWS_ACCESS_KEY_ID", None)
-            data['SecretAccessKey'] = os.environ.get(
-                "AWS_SECRET_ACCESS_KEY", None)
-            data['Token'] = os.environ.get("AWS_SESSION_TOKEN", None)
-
-        if data.get("AccessKeyId") is None:
-            self.__get_role()
-            data = self.__request_json(urllib.parse.urljoin(self.credentials_metadata,
-                                                            str(self.iamrole, 'utf-8')))
-
-        self.access_key = data['AccessKeyId']
-        if self.access_key is None or self.access_key == '':
-            raise Exception("AccessKeyId required")
-
-        self.secret_key = data['SecretAccessKey']
-        if self.secret_key is None or self.secret_key == '':
-            raise Exception("SecretAccessKey required")
-
-        self.token = data.get('Token')
-
-    def v4Sign(self, key, msg):
-        return hmac.new(key, msg.encode('utf-8'), hashlib.sha256).digest()
-
-    def getSignatureKey(self, dateStamp, serviceName):
-        kDate = self.v4Sign(
-            ('AWS4' + self.secret_key).encode('utf-8'), dateStamp)
-        kRegion = self.v4Sign(kDate, self.region)
-        kService = self.v4Sign(kRegion, serviceName)
-        kSigning = self.v4Sign(kService, 'aws4_request')
-        return kSigning
-
-    def uriopen(self, uri):
-        """uriopen(uri) open the remote file and return a file object."""
-        try:
-            return urllib.request.urlopen(self._request(uri), None, 30)
-        except urllib.error.HTTPError as e:
-            # HTTPError is a "file like object" similar to what
-            # urllib.request.urlopen returns, so return it and let caller
-            # deal with the error code
-            if e.code == 400:
-                # token errors are buried in 400 messages so expose
-                xmlResponse = ET.fromstring(e.read())
-                if xmlResponse is not None:
-                    e.msg = "{} - {}".format(e,
-                                             xmlResponse.find("Message").text)
-            if e.code == 301:
-                e.msg = "{} - Set s3auth.conf region to match bucket 'Region':\
- bucket may not be in {}".format(e, self.region)
-
-            return e
-        # For other errors, throw an exception directly
-        except urllib.error.URLError as e:
-            if hasattr(e, 'reason'):
-                raise Exception("URL error reason: gc" % e.reason)
-            elif hasattr(e, 'code'):
-                raise Exception("Server error code: gc" % e.code)
-        except socket.timeout:
-            raise Exception("Socket timeout")
-
-    def _request(self, uri):
-        uri_parsed = urllib.parse.urlparse(uri)
-        # Below if statement is to accommodate AWS guidance in regards buckets
-        # naming convention presented in
-        # https://docs.aws.amazon.com/AmazonS3/latest/dev/BucketRestrictions.html
-        # S3 bucket names for apt repo can NOT contain '.' in the name
-        # otherwise TLS certs are broken
-        if '.' in uri_parsed.netloc:
-            raise Exception("uri should not include fully qualified domain \
- name for bucket")
-
-        scheme = 'https'
-        bucket = uri_parsed.netloc
-        host = '{}.{}'.format(bucket, self.host)
-        path = '{}'.format(urllib.parse.quote(uri_parsed.path, safe='-._~/'))
-
-        s3url = urllib.parse.urlunparse(
-            (
-                scheme,
-                host,
-                path,
-                '',
-                '',
-                ''
-            )
-        )
-
-        request = urllib.request.Request(s3url)
-
-        request.add_header('x-amz-content-sha256', self._payload_hash(request))
-
-        # Create a date for headers and the credential string
-        amzdate = datetime.datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
-
-        request.add_header('x-amz-date', amzdate)
-
-        if self.token is not None and self.token != '':
-            request.add_header('x-amz-security-token', self.token)
-
-        canonical_request = self._canonical_request(request, host, amzdate)
-
-        authorization_header = self._authorization_header(
-            canonical_request, amzdate)
-
-        request.add_header('Authorization', authorization_header)
-
-        return request
-
-    def _authorization_header(self, canonical_request, amzdate):
-        """
-        AWS documentation for signing requests with v4Sign:
-            https://docs.aws.amazon.com/general/latest/gr/sigv4_signing.html
-        """
-        datestamp = amzdate.split('T')[0]
-
-        algorithm = 'AWS4-HMAC-SHA256'
-        credential_scope = datestamp + '/' + self.region + '/s3/aws4_request'
-
-        string_to_sign = algorithm + '\n' \
-            + amzdate + '\n' \
-            + credential_scope + '\n' \
-            + canonical_request
-
-        signing_key = self.getSignatureKey(datestamp, 's3')
-        signature = hmac.new(signing_key, string_to_sign.encode(
-            'utf-8'), hashlib.sha256).hexdigest()
-
-        authorization_header = "{} Credential={}/{}, SignedHeaders={}, Signature={}".format(
-            algorithm,
-            self.access_key,
-            credential_scope,
-            self._signed_headers(),
-            signature
-        )
-
-        return authorization_header
-
-    def _canonical_request(self, request, host, amzdate):
-
-        canonical_uri = request.selector
-        canonical_querystring = ''
-
-        canonical_headers = 'host:' + host + '\n' \
-                            + 'x-amz-content-sha256:' \
-                            + self._payload_hash(request) + '\n' \
-                            + 'x-amz-date:' + amzdate + '\n'
-
-        if self.token is not None and self.token != '':
-            canonical_headers += 'x-amz-security-token:' + self.token + '\n'
-
-        canonical_request = request.get_method() + '\n' \
-            + canonical_uri + '\n' \
-            + canonical_querystring + '\n' \
-            + canonical_headers + '\n' \
-            + self._signed_headers() + '\n' \
-            + self._payload_hash(request)
-
-        return hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()
-
-    def _signed_headers(self):
-        signed_headers = 'host;x-amz-content-sha256;x-amz-date'
-        if self.token is not None and self.token != '':
-            signed_headers += ';x-amz-security-token'
-        return signed_headers
-
-    def _payload_hash(self, request):
-        payload = request.data
-        if payload is None:
-            payload = ''.encode('utf-8')
-
-        return hashlib.sha256(payload).hexdigest()
+APT_CACHE_PATH = Path("/var/cache/apt")
+GITLFS_APT_CACHE_PATH = APT_CACHE_PATH / "gitlfs"
 
 
 class APTMessage(object):
@@ -391,18 +40,11 @@ class APTMessage(object):
         return result + '\n'
 
 
-class GitLfsMethod:
-    __eof = False
+class APTTransport:
+    def __init__(self):
+        self.__eof = False
 
-    def __init__(self, config_file='/etc/apt/gitlfs.conf'):
-        # self.iam = AWSCredentials(config_file)
-        # self.iam.get_credentials()
-        self.send_capabilities()
-
-    def fail(self, message='Failed'):
-        self.send_uri_failure({'URI': self.uri, 'Message': message})
-
-    def _read_message(self):
+    def read_message(self):
         """
         Apt uses for communication with its methods the text protocol similar
         to http. This function parses the protocol messages from stdin.
@@ -455,24 +97,85 @@ class GitLfsMethod:
     def send_uri_failure(self, headers):
         self.send(400, headers)
 
+
+class GitLFSRepo:
+    @staticmethod
+    def Clone(git_uri: str):
+        GITLFS_APT_CACHE_PATH.mkdir(exist_ok=True)
+
+        repo_name = ''
+        proc = subprocess.run(['git', 'clone', git_uri, repo_name], cwd=GITLFS_APT_CACHE_PATH, capture_output=True)
+
+        if proc.returncode == 0:
+            return GitLFSRepo(Path(repo_name))
+        else:
+            raise RuntimeError(f"Failed to git-clone: {proc.stderr}")
+
+    def __init__(self, path: Path):
+        self.repo_root_path = path
+
+        if not (path / ".git").exists():
+            raise RuntimeError("Given path is not a git repository")
+
+        if not (path / ".git"/ "lfs").exists():
+            self.lfs_init()
+
+    def git_reset_hard(self):
+        subprocess.run(['git', 'reset', '--hard'], cwd=self.repo_root_path, capture_output=True)
+
+    def git_pull(self):
+        p = subprocess.run(['git', 'pull'], cwd=self.repo_root_path, capture_output=True)
+        if p.returncode != 0:
+            raise RuntimeError(f"Failed to git-pull: {p.stderr}")
+
+    def lfs_init(self):
+        p = subprocess.run(['git', 'lfs', 'install'], cwd=self.repo_root_path, capture_output=True)
+        if p.returncode != 0:
+            raise RuntimeError(f"Failed to git-lfs-install: {p.stderr}")
+
+    def lfs_fetch_path(self, filename: Path):
+        p = subprocess.run(['git', 'lfs', 'fetch', '-I', str(filename)], cwd=self.repo_root_path, capture_output=True)
+        if p.returncode != 0:
+            raise RuntimeError(f"Failed to git-lfs-fetch: {p.stderr}")
+
+    # def lfs_checkout_path(self, file_path: Path):
+    #     "git lfs checkout PATH"
+        # this might not be needed - can just pass the object filename
+        # pass
+
+    def resolve_path(self, filename: str):
+        return Path.cwd()
+
+
+class GitLFSMethod:
+    def __init__(self, config_file='/etc/apt/gitlfs.conf'):
+        self.transport = APTTransport()
+        self.transport.send_capabilities()
+        self.repos = {}
+
+    def fail(self, uri, message='Failed'):
+        self.transport.send_uri_failure({'URI': uri, 'Message': message})
+
     def run(self):
         """Loop through requests on stdin"""
         while True:
-            message = self._read_message()
+            message = self.transport.read_message()
             if message is None:
                 return 0
             if message['_number'] == 601:
                 try:
                     self.configure(message)
                 except Exception as e:
-                    self.fail(e.__class__.__name__ + ": " + str(e))
+                    logging.error(traceback.format_exc())
+                    self.fail(message['URI'][0], e.__class__.__name__ + ": " + str(e))
             elif message['_number'] == 600:
                 try:
                     self.fetch(message)
                 except Exception as e:
-                    self.fail(e.__class__.__name__ + ": " + str(e))
+                    logging.error(traceback.format_exc())
+                    self.fail(message['URI'][0], e.__class__.__name__ + ": " + str(e))
             else:
-                self.fail(str(message['_text']))
+                self.fail(message['URI'][0], str(message['_text']))
 
     def configure(self, message):
         """
@@ -487,116 +190,85 @@ class GitLfsMethod:
                     os.environ['http_proxy'] = value
                     os.environ['https_proxy'] = value
 
-    def format_error_response(self, response):
-        """Extracts Info from AWS Error Repsonse and returns a formatted string
+    @staticmethod
+    def uri_to_git(uri: urllib.parse.ParseResult):
 
-        When the S3 API returns an error the body of the response also contains
-        information about the error. This function reads the Response object
-        for the body and returns a string of the form "[{Code}] {Message}"
+        out = ""
 
-        will return an empty string when the response can not be parsed
+        if uri.scheme == 'gitlfs+https':
+            # https://github.com/Greenroom-Robotics/packages-test.git
+            # Out[9]: ParseResult(scheme='gitlfs+https', netloc='github.com', path='/Greenroom-Robotics/packages-test.git/Release', params='', query='', fragment='')
+            out += "https://"
+        elif uri.scheme == "gitlfs+git":
+            # In [11]: urlparse("gitlfs+git://git@github.com:Greenroom-Robotics/packages-test.git")
+            # Out[11]: ParseResult(scheme='gitlfs+git', netloc='git@github.com:Greenroom-Robotics', path='/packages-test.git', params='', query='', fragment='')
+            out += "git@"
+            # TODO
 
-        https://docs.aws.amazon.com/AmazonS3/latest/API/ErrorResponses.html#RESTErrorResponses
-        """
-        # try:
-        #     error = ET.fromstring(response.read())
-        # except ET.ParseError:
-        #     return ''
-        #
-        # code = error.find('Code')
-        # message = error.find('Message')
-        # if code is not None and message is not None:
-        #     return '[{}] {}'.format(code.text, message.text)
+        out += uri.netloc
+        paths = Path(uri.path)
+        
 
-        # fallback to returning an empty string
-        return ''
+        return out
 
     def fetch(self, msg):
-        self.uri = msg['URI'][0]
+        logging.debug(msg)
+        uri = urlparse(msg['URI'][0])
+        output_filename = msg['Filename'][0]
+        # self.transport.send_status({'URI': self.uri, 'Message': 'Waiting for headers'})
 
-        self.filename = msg['Filename'][0]
+        git_uri = self.uri_to_git(uri)
+        repo = self.repos.get(git_uri, None)
 
-        self.send_status({'URI': self.uri, 'Message': 'Waiting for headers'})
-        for i in range(0, RETRIES):
-            try:
-                response = self.iam.uriopen(self.uri)
-            except ssl.SSLError as e:
-                if 'timed out' in e.message:
-                    time.sleep(wait_time(i + 1))
-                    continue
-                else:
-                    raise e
-            except socket.timeout:
-                time.sleep(wait_time(i + 1))
-                continue
+        if repo is None:
+            # haven't seen this uri this session, so we should refresh or clone it
+            self.transport.send_status({'URI': msg['URI'][0], 'Message': 'Waiting for headers'})
+            if True: # if in cache
+                repo = GitLFSRepo(git_uri)
+                repo.git_reset_hard()
+                repo.git_pull()
+            else:
+                repo = GitLFSRepo.Clone(uri.netloc, uri)
 
-            self.send_status({
-                'URI': self.uri,
+            self.repos[uri] = repo
+
+        file_path = repo.resolve_path(filename)
+
+        if True:
+            self.transport.send_status({
+                'URI': msg['URI'][0],
                 'Message': 'Waiting for headers'})
+            repo.lfs_fetch_path(filename)
 
-            if response.code != 200:
-                error_detail = self.format_error_response(response)
-                self.send_uri_failure({
-                    'URI': self.uri,
-                    'Message': '{}  {}  {}'.format(response.code,
-                                                   response.msg,
-                                                   error_detail),
-                    'FailReason': 'HttpError' + str(response.code)})
-                try:
-                    while True:
-                        data = response.read(4096)
-                        if not len(data):
-                            break
-                except ssl.SSLError as e:
-                    if 'timed out' in e.message:
-                        pass
-                    else:
-                        raise e
-                except socket.timeout:
-                    pass
-                finally:
-                    response.close()
+        if not file_path.is_file() or not file_path.exists():
+            error_detail = "Filename is not in git repository"
+            self.transport.send_uri_failure({
+                'URI': msg['URI'][0],
+                'Message': f'{error_detail}',
+                'FailReason': 'HttpError404'})
+            return
 
-                return
+        file_size = 0
 
-            self.send_uri_start({
-                'URI': self.uri,
-                'Size': response.headers.get('content-length'),
-                'Last-Modified': response.headers.get('last-modified')})
+        self.transport.send_uri_start({
+            'URI': msg['URI'][0],
+            'Size': file_size,
+            'Last-Modified': response.headers.get('last-modified')})
 
-            f = open(self.filename, "wb")
-            hash_sha256 = hashlib.sha256()
-            hash_sha512 = hashlib.sha512()
-            hash_md5 = hashlib.md5()
-            try:
-                while True:
-                    data = response.read(4096)
-                    if not len(data):
-                        break
-                    hash_sha256.update(data)
-                    hash_sha512.update(data)
-                    hash_md5.update(data)
-                    f.write(data)
-                break
-            except ssl.SSLError as e:
-                if 'timed out' in e.message:
-                    time.sleep(wait_time(i + 1))
-                else:
-                    raise e
-            except socket.timeout:
-                time.sleep(wait_time(i + 1))
+        hash_sha256 = hashlib.sha256()
+        hash_sha512 = hashlib.sha512()
+        hash_md5 = hashlib.md5()
 
-            finally:
-                response.close()
-                f.close()
+        # hash_sha512.
 
-        else:
-            raise Exception("Fetch request timed out")
+        # hash_sha256.update(data)
+        # hash_sha512.update(data)
+        # hash_md5.update(data)
 
-        self.send_uri_done({
-            'URI': self.uri,
-            'Filename': self.filename,
-            'Size': response.headers.get('content-length'),
+        self.transport.send_uri_done({
+            'URI': msg['URI'][0],
+            'Filename': output_filename,
+            'Size': file_size,
             'Last-Modified': response.headers.get('last-modified'),
             'MD5-Hash': hash_md5.hexdigest(),
             'MD5Sum-Hash': hash_md5.hexdigest(),
@@ -609,7 +281,11 @@ if __name__ == '__main__':
         config = '/etc/apt/gitlfs.conf'
         if len(sys.argv) == 2 and os.path.isfile(sys.argv[1]):
             config = sys.argv[1]
-        method = GitLfsMethod(config)
+        method = GitLFSMethod(config)
+        logging.getLogger().setLevel(logging.DEBUG)
+        logging.debug(f"Working dir: {Path.cwd()}")
+        logging.debug(f"UID: {subprocess.run(['/usr/bin/id'], capture_output=True).stdout.decode('utf8')}")
+
         ret = method.run()
         sys.exit(ret)
     except KeyboardInterrupt:

@@ -3,7 +3,6 @@
 # Author: Russ Webber <russ.webber@greenroomrobotics.com>
 
 import time
-import hashlib
 import sys
 import os
 import logging
@@ -16,6 +15,7 @@ import subprocess
 
 APT_CACHE_PATH = Path("/var/cache/apt")
 GITLFS_APT_CACHE_PATH = APT_CACHE_PATH / "gitlfs"
+LFS_OBJECTS = Path(".git/lfs/objects")
 
 
 class APTMessage(object):
@@ -101,14 +101,37 @@ class APTTransport:
 
 class GitLFSRepo:
     @staticmethod
-    def Clone(git_uri: str, checkout_path: Path):
+    def clone(git_uri: str, checkout_path: Path):
         GITLFS_APT_CACHE_PATH.mkdir(exist_ok=True)
-        proc = subprocess.run(['git', 'clone', git_uri, checkout_path], cwd=GITLFS_APT_CACHE_PATH, capture_output=True)
+        proc = subprocess.run(['git', 'clone', git_uri, checkout_path], env={'GIT_TERMINAL_PROMPT': '0'},
+                              cwd=GITLFS_APT_CACHE_PATH, capture_output=True, check=True)
+        # TODO this should return correct error in apt instead of 404
+        return GitLFSRepo(checkout_path)
 
-        if proc.returncode == 0:
-            return GitLFSRepo(checkout_path)
-        else:
-            raise RuntimeError(f"Failed to git-clone: {proc.stderr}")
+    @staticmethod
+    def checksum(hash_bin: str, file_path: Path):
+        proc = subprocess.run([hash_bin, file_path], capture_output=True, check=True)
+        cs, _ = proc.stdout.decode('utf8').split(" ", 1)
+
+        return cs
+
+    @staticmethod
+    def read_lfs_pointer(path: Path):
+        # version https://git-lfs.github.com/spec/v1
+        # oid sha256:08963d540efcade97f7765403e8762df373a0a5a89e821dfc6118f3534b585c5
+        # size 84492
+        try:
+            with path.open('rt', encoding='ascii') as f:
+                if not f.readline(limit=50).strip().startswith("version https://git-lfs.github.com/spec/v"):
+                    return None
+
+                k, v = f.readline().strip().split(':')
+                if k != 'oid sha256':
+                    return None
+
+                return v
+        except RuntimeError as e:
+            return None
 
     def __init__(self, path: Path):
         self.repo_root_path = path
@@ -142,8 +165,19 @@ class GitLFSRepo:
         # this might not be needed - can just pass the object filename
         # pass
 
-    def resolve_path(self, filename: Path):
-        return Path.cwd()
+    def resolve_path(self, file_path: Path):
+        repo_file_path = self.repo_root_path / file_path
+
+        if not repo_file_path.is_file():
+            return None
+
+        cs = GitLFSRepo.read_lfs_pointer(repo_file_path)
+
+        if cs is None:
+            # file is not a lfs pointer
+            return repo_file_path
+        else:
+            return self.repo_root_path / LFS_OBJECTS / cs[0:2] / cs[2:4] / cs
 
 
 def split_uri_by(s: str, needle: str):
@@ -216,21 +250,15 @@ class GitLFSMethod:
         file_path = None
 
         if uri.scheme == 'gitlfs+https':
-            # https://github.com/Greenroom-Robotics/packages-test.git
             path1, file_path = split_uri_by(uri.path, '.git')
             out = f"https://{uri.netloc}{path1}"
-            # logging.debug(f"Part1: {path1} | part2: {file_path}")
 
         elif uri.scheme == "gitlfs+git":
-            # In [11]: urlparse("gitlfs+git://git@github.com:Greenroom-Robotics/packages-test.git")
-            # Out[11]: ParseResult(scheme='gitlfs+git', netloc='git@github.com:Greenroom-Robotics', path='/packages-test.git', params='', query='', fragment='')
             path1, file_path = split_uri_by(uri.path, '.git')
-
-            # apt doesn't support : in URIs
+            # sources.list doesn't support : in URIs
             path1 = str(path1)
             assert path1[0] == '/'
             path1 = ':' + path1[1:]
-
             out = f"{uri.netloc}{path1}"
 
         return out, file_path
@@ -254,18 +282,18 @@ class GitLFSMethod:
                 repo.git_reset_hard()
                 repo.git_pull()
             else:
-                repo = GitLFSRepo.Clone(git_uri, repo_path)
+                repo = GitLFSRepo.clone(git_uri, repo_path)
 
             self.repos[git_uri] = repo
 
-        if not requested_file_path.is_file() or not requested_file_path.exists():
+        lfs_file_path = repo.resolve_path(requested_file_path)
+
+        if lfs_file_path is None:
             self.transport.send_uri_failure({
                 'URI': msg['URI'][0],
                 'Message': f'Filename is not in git repository',
                 'FailReason': 'HttpError404'})
             return
-
-        lfs_file_path = repo.resolve_path(requested_file_path)
 
         if not lfs_file_path.exists():
             # if this file is not in the lfs objects store
@@ -274,44 +302,42 @@ class GitLFSMethod:
                 'Message': 'Waiting for headers'})
             repo.lfs_fetch_path(requested_file_path)
 
-        file_size = 0
+        subprocess.run(['cp', lfs_file_path, output_filename], capture_output=True, check=True)
+
+        file_size = os.path.getsize(lfs_file_path)
+        hash_sha256 = GitLFSRepo.checksum('sha256sum', lfs_file_path)
+        hash_sha512 = GitLFSRepo.checksum('sha512sum', lfs_file_path)
+        hash_md5 = GitLFSRepo.checksum('md5sum', lfs_file_path)
+
+        #  <day-name>, <day> <month> <year> <hour>:<minute>:<second> GMT
+        last_modified = time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime(os.path.getmtime(lfs_file_path)))
 
         self.transport.send_uri_start({
             'URI': msg['URI'][0],
             'Size': file_size,
-            'Last-Modified': response.headers.get('last-modified')})
-
-        hash_sha256 = hashlib.sha256()
-        hash_sha512 = hashlib.sha512()
-        hash_md5 = hashlib.md5()
-
-        # hash_sha512.
-
-        # hash_sha256.update(data)
-        # hash_sha512.update(data)
-        # hash_md5.update(data)
+            'Last-Modified': last_modified
+        })
 
         self.transport.send_uri_done({
             'URI': msg['URI'][0],
             'Filename': output_filename,
             'Size': file_size,
-            'Last-Modified': response.headers.get('last-modified'),
-            'MD5-Hash': hash_md5.hexdigest(),
-            'MD5Sum-Hash': hash_md5.hexdigest(),
-            'SHA256-Hash': hash_sha256.hexdigest(),
-            'SHA512-Hash': hash_sha512.hexdigest()})
+            'Last-Modified': last_modified,
+            'MD5-Hash': hash_md5,
+            'MD5Sum-Hash': hash_md5,
+            'SHA256-Hash': hash_sha256,
+            'SHA512-Hash': hash_sha512
+        })
 
 
 if __name__ == '__main__':
     try:
+        logging.getLogger().setLevel(logging.DEBUG)
+
         config = '/etc/apt/gitlfs.conf'
         if len(sys.argv) == 2 and os.path.isfile(sys.argv[1]):
             config = sys.argv[1]
         method = GitLFSMethod(config)
-        logging.getLogger().setLevel(logging.DEBUG)
-        # logging.debug(f"Working dir: {Path.cwd()}")
-        # logging.debug(f"UID: {subprocess.run(['/usr/bin/id'], capture_output=True).stdout.decode('utf8')}")
-
         ret = method.run()
         sys.exit(ret)
     except KeyboardInterrupt:

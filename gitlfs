@@ -122,7 +122,7 @@ class GitLFSRepo:
         # size 84492
         try:
             with path.open('rt', encoding='ascii') as f:
-                if not f.readline(limit=50).strip().startswith("version https://git-lfs.github.com/spec/v"):
+                if not f.readline().strip().startswith("version https://git-lfs.github.com/spec/v"):
                     return None
 
                 k, v = f.readline().strip().split(':')
@@ -130,7 +130,7 @@ class GitLFSRepo:
                     return None
 
                 return v
-        except RuntimeError as e:
+        except UnicodeDecodeError as e:
             return None
 
     def __init__(self, path: Path):
@@ -145,7 +145,18 @@ class GitLFSRepo:
     def git_reset_hard(self):
         subprocess.run(['git', 'reset', '--hard'], cwd=self.repo_root_path, capture_output=True)
 
+    def git_lfs_pull(self, filename: Path):
+        # TODO needs to check if the user == root otherwise skip
+
+        p = subprocess.run(['git', 'lfs', 'pull', '-I', str(filename)], cwd=self.repo_root_path, capture_output=True)
+        if p.returncode != 0:
+            raise RuntimeError(f"Failed to git-pull: {p.stderr}")
+
     def git_pull(self):
+        # TODO needs to check if the user == root otherwise skip
+        logging.debug(f"Working dir: {Path.cwd()}")
+        logging.debug(f"UID: {subprocess.run(['/usr/bin/id'], capture_output=True).stdout.decode('utf8')}")
+
         p = subprocess.run(['git', 'pull'], cwd=self.repo_root_path, capture_output=True)
         if p.returncode != 0:
             raise RuntimeError(f"Failed to git-pull: {p.stderr}")
@@ -156,6 +167,7 @@ class GitLFSRepo:
             raise RuntimeError(f"Failed to git-lfs-install: {p.stderr}")
 
     def lfs_fetch_path(self, filename: Path):
+        logging.debug(f"Running fetch for {filename}")
         p = subprocess.run(['git', 'lfs', 'fetch', '-I', str(filename)], cwd=self.repo_root_path, capture_output=True)
         if p.returncode != 0:
             raise RuntimeError(f"Failed to git-lfs-fetch: {p.stderr}")
@@ -300,7 +312,9 @@ class GitLFSMethod:
             self.transport.send_status({
                 'URI': msg['URI'][0],
                 'Message': 'Waiting for headers'})
-            repo.lfs_fetch_path(requested_file_path)
+            repo.git_lfs_pull(requested_file_path)
+            # repo.lfs_fetch_path(requested_file_path)
+            lfs_file_path = repo_path / requested_file_path
 
         subprocess.run(['cp', lfs_file_path, output_filename], capture_output=True, check=True)
 

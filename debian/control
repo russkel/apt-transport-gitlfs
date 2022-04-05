@@ -1,0 +1,15 @@
+Source: apt-transport-gitlfs
+Section: unknown
+Priority: optional
+Maintainer: Russ <russ@rw.id.au>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.0
+Homepage: https://github.com/russkel/apt-transport-gitlfs
+#Vcs-Browser: https://salsa.debian.org/debian/apt-transport-gitlfs
+#Vcs-Git: https://salsa.debian.org/debian/apt-transport-gitlfs.git
+Rules-Requires-Root: no
+
+Package: apt-transport-gitlfs
+Architecture: all
+Depends: ${misc:Depends}
+Description: APT transport using GitLFS

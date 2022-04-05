@@ -1,0 +1,5 @@
+apt-transport-gitlfs (0.1.0-1) UNRELEASED; urgency=medium
+
+  * Initial release (Closes: #nnnn)  <nnnn is the bug number of your ITP>
+
+ -- Russ <russ@unknown>  Tue, 05 Apr 2022 12:21:15 +1000

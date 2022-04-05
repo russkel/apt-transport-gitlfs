@@ -117,9 +117,6 @@ class GitLFSRepo:
 
     @staticmethod
     def read_lfs_pointer(path: Path):
-        # version https://git-lfs.github.com/spec/v1
-        # oid sha256:08963d540efcade97f7765403e8762df373a0a5a89e821dfc6118f3534b585c5
-        # size 84492
         try:
             with path.open('rt', encoding='ascii') as f:
                 if not f.readline().strip().startswith("version https://git-lfs.github.com/spec/v"):
@@ -148,9 +145,11 @@ class GitLFSRepo:
     def git_lfs_pull(self, filename: Path):
         # TODO needs to check if the user == root otherwise skip
 
-        p = subprocess.run(['git', 'lfs', 'pull', '-I', str(filename)], cwd=self.repo_root_path, capture_output=True)
+        p = subprocess.run(['git', 'lfs', 'pull', '-X', '', '-I', str(filename)], cwd=self.repo_root_path, capture_output=True)
         if p.returncode != 0:
             raise RuntimeError(f"Failed to git-pull: {p.stderr}")
+
+        logging.debug(f"stdout: {p.stdout}\nstderr: {p.stderr}")
 
     def git_pull(self):
         # TODO needs to check if the user == root otherwise skip
@@ -172,12 +171,7 @@ class GitLFSRepo:
         if p.returncode != 0:
             raise RuntimeError(f"Failed to git-lfs-fetch: {p.stderr}")
 
-    # def lfs_checkout_path(self, file_path: Path):
-    #     "git lfs checkout PATH"
-        # this might not be needed - can just pass the object filename
-        # pass
-
-    def resolve_path(self, file_path: Path):
+    def resolve_lfs_path(self, file_path: Path):
         repo_file_path = self.repo_root_path / file_path
 
         if not repo_file_path.is_file():
@@ -213,7 +207,7 @@ def sanitise_uri(s: str):
 
 
 class GitLFSMethod:
-    def __init__(self, config_file='/etc/apt/gitlfs.conf'):
+    def __init__(self):
         self.transport = APTTransport()
         self.transport.send_capabilities()
         self.repos = {}
@@ -276,12 +270,11 @@ class GitLFSMethod:
         return out, file_path
 
     def fetch(self, msg):
-        logging.debug(msg)
+        logging.debug(f"APT Message: {msg}")
         uri = urlparse(msg['URI'][0])
         output_filename = msg['Filename'][0]
         git_uri, requested_file_path = self.uri_to_git(uri)
         repo_path = GITLFS_APT_CACHE_PATH / sanitise_uri(git_uri)
-        # logging.debug(f"git uri: {git_uri} | file path: {requested_file_path} | repo_path: {repo_path}")
 
         repo = self.repos.get(git_uri, None)
 
@@ -298,24 +291,21 @@ class GitLFSMethod:
 
             self.repos[git_uri] = repo
 
-        lfs_file_path = repo.resolve_path(requested_file_path)
+        lfs_file_path = repo_path / requested_file_path
 
-        if lfs_file_path is None:
+        if not lfs_file_path.is_file():
             self.transport.send_uri_failure({
                 'URI': msg['URI'][0],
                 'Message': f'Filename is not in git repository',
                 'FailReason': 'HttpError404'})
             return
 
-        if not lfs_file_path.exists():
-            # if this file is not in the lfs objects store
-            self.transport.send_status({
-                'URI': msg['URI'][0],
-                'Message': 'Waiting for headers'})
-            repo.git_lfs_pull(requested_file_path)
-            # repo.lfs_fetch_path(requested_file_path)
-            lfs_file_path = repo_path / requested_file_path
+        self.transport.send_status({
+            'URI': msg['URI'][0],
+            'Message': 'Waiting for headers'})
+        repo.git_lfs_pull(requested_file_path)
 
+        logging.debug(f"Copying {lfs_file_path} --> {output_filename}")
         subprocess.run(['cp', lfs_file_path, output_filename], capture_output=True, check=True)
 
         file_size = os.path.getsize(lfs_file_path)
@@ -346,12 +336,8 @@ class GitLFSMethod:
 
 if __name__ == '__main__':
     try:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-        config = '/etc/apt/gitlfs.conf'
-        if len(sys.argv) == 2 and os.path.isfile(sys.argv[1]):
-            config = sys.argv[1]
-        method = GitLFSMethod(config)
+        logging.getLogger().setLevel(logging.INFO)
+        method = GitLFSMethod()
         ret = method.run()
         sys.exit(ret)
     except KeyboardInterrupt:
